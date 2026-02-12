@@ -92,21 +92,71 @@ float *qwen_parse_wav_buffer(const uint8_t *data, size_t file_size, int *out_n_s
         }
     }
 
-    /* Resample to 16kHz if needed */
+    /* Resample to 16kHz if needed — windowed-sinc interpolation with
+     * Kaiser window for proper anti-aliasing when downsampling. */
     if (sample_rate != SAMPLE_RATE) {
         int new_n = (int)((long long)n_frames * SAMPLE_RATE / sample_rate);
         float *resampled = (float *)malloc(new_n * sizeof(float));
         if (!resampled) { free(samples); return NULL; }
+
+        /* Sinc resampler parameters */
+        const int SINC_HALF = 16;          /* zero-crossings per side */
+        const double KAISER_BETA = 6.0;    /* sidelobe suppression */
+        /* Cutoff at the lower Nyquist to prevent aliasing */
+        double ratio = (double)SAMPLE_RATE / (double)sample_rate;
+        double cutoff = (ratio < 1.0) ? ratio : 1.0;
+
+        /* Precompute Kaiser window: I0(beta * sqrt(1 - (n/N)^2)) / I0(beta)
+         * I0 approximation via power series (converges fast for beta <= 10). */
+        /* I0 (modified Bessel, first kind, order 0) */
+        #define BESSEL_I0(x) ({ \
+            double _sum = 1.0, _term = 1.0, _xx = (x)*(x); \
+            for (int _k = 1; _k <= 20; _k++) { \
+                _term *= _xx / (4.0 * (double)_k * (double)_k); \
+                _sum += _term; \
+            } \
+            _sum; })
+        double inv_I0_beta = 1.0 / BESSEL_I0(KAISER_BETA);
+
         for (int i = 0; i < new_n; i++) {
-            float src_pos = (float)i * sample_rate / SAMPLE_RATE;
-            int idx = (int)src_pos;
-            float frac = src_pos - idx;
-            if (idx + 1 < n_frames) {
-                resampled[i] = samples[idx] * (1.0f - frac) + samples[idx + 1] * frac;
-            } else {
-                resampled[i] = (idx < n_frames) ? samples[idx] : 0.0f;
+            double src_pos = (double)i / ratio;
+            int center = (int)src_pos;
+            double acc = 0.0;
+            double wsum = 0.0;
+
+            int j_lo = center - SINC_HALF + 1;
+            int j_hi = center + SINC_HALF;
+            for (int j = j_lo; j <= j_hi; j++) {
+                double d = (double)j - src_pos;        /* distance in source samples */
+                double x = d * cutoff;                  /* scale by cutoff */
+
+                /* Sinc value */
+                double s;
+                if (fabs(x) < 1e-9) {
+                    s = 1.0;
+                } else {
+                    s = sin(M_PI * x) / (M_PI * x);
+                }
+
+                /* Kaiser window over the support [-SINC_HALF, SINC_HALF] */
+                double npos = d / SINC_HALF;  /* normalized to [-1, 1] */
+                double w;
+                if (npos <= -1.0 || npos >= 1.0) {
+                    w = 0.0;
+                } else {
+                    w = BESSEL_I0(KAISER_BETA * sqrt(1.0 - npos * npos)) * inv_I0_beta;
+                }
+
+                double coeff = s * w * cutoff;
+                if (j >= 0 && j < n_frames) {
+                    acc += samples[j] * coeff;
+                }
+                wsum += coeff;
             }
+            /* Normalize to handle edge effects at boundaries */
+            resampled[i] = (wsum > 1e-9) ? (float)(acc / wsum) : 0.0f;
         }
+        #undef BESSEL_I0
         free(samples);
         samples = resampled;
         n_frames = new_n;
