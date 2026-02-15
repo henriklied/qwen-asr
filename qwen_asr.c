@@ -1697,86 +1697,11 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
         }
         int n_chunk_tokens = 0;
 
-        /* Live eager emit: emit text tokens via token_cb during decode
-         * instead of waiting for the post-decode commit phase.
-         * Uses text-level byte counting (not token counting) so that
-         * tokenization differences after EOS-reset don't cause word loss. */
-        int eager_active = 0;
-        int eager_saw_asr = 0;
-        int eager_prefix_text_bytes = 0;
-        int eager_gen_text_bytes = 0;
-        int eager_mismatch = 0;
-        size_t result_len_before_eager = result_len;
-
-        if (live && !live_eof && ctx->token_cb && chunk_idx >= unfixed_chunks) {
-            eager_active = 1;
-            /* Count text bytes from ALL prefix tokens (n_prefix_tokens_full),
-             * not just the capped subset fed to the decoder.  This ensures
-             * the eager emit frontier matches the full result position. */
-            if (ctx->n_force_prompt_tokens > 0) {
-                eager_saw_asr = 1;
-                for (int i = 0; i < n_prefix_tokens_full; i++) {
-                    const char *p = qwen_tokenizer_decode(tokenizer, raw_tokens[i]);
-                    eager_prefix_text_bytes += (int)strlen(p);
-                }
-            } else {
-                int saw = 0;
-                for (int i = 0; i < n_prefix_tokens_full; i++) {
-                    if (raw_tokens[i] == QWEN_TOKEN_ASR_TEXT) { saw = 1; continue; }
-                    if (saw) {
-                        const char *p = qwen_tokenizer_decode(tokenizer, raw_tokens[i]);
-                        eager_prefix_text_bytes += (int)strlen(p);
-                    }
-                }
-            }
-        }
-
         while (n_generated < max_new_tokens) {
             n_generated++;
             if (token == QWEN_TOKEN_ENDOFTEXT || token == QWEN_TOKEN_IM_END) break;
 
             chunk_tokens[n_chunk_tokens++] = token;
-
-            /* Eager emit: use text byte counting against result_len to
-             * determine when we've passed the committed frontier.
-             * Also appends emitted text to result so the commit phase
-             * sees it and doesn't re-emit. */
-            if (eager_active) {
-                if (!eager_saw_asr && token == QWEN_TOKEN_ASR_TEXT) {
-                    eager_saw_asr = 1;
-                } else if (eager_saw_asr && !eager_mismatch) {
-                    const char *piece = qwen_tokenizer_decode(tokenizer, token);
-                    int piece_len = (int)strlen(piece);
-                    int total_before = eager_prefix_text_bytes + eager_gen_text_bytes;
-                    eager_gen_text_bytes += piece_len;
-                    int total_after = total_before + piece_len;
-                    /* Verify overlap with committed result */
-                    if (total_before < (int)result_len_before_eager) {
-                        int check_end = total_after < (int)result_len_before_eager
-                                            ? total_after : (int)result_len_before_eager;
-                        if (memcmp(piece, result + total_before,
-                                   check_end - total_before) != 0)
-                            eager_mismatch = 1;
-                    }
-                    if (!eager_mismatch && total_after > (int)result_len_before_eager) {
-                        int skip = 0;
-                        if (total_before < (int)result_len_before_eager)
-                            skip = (int)result_len_before_eager - total_before;
-                        const char *emit_start = piece + skip;
-                        int emit_len = piece_len - skip;
-                        ctx->token_cb(emit_start, ctx->token_cb_userdata);
-                        /* Append to result so commit phase won't re-emit */
-                        if (result_len + (size_t)emit_len + 1 > result_cap) {
-                            while (result_len + (size_t)emit_len + 1 > result_cap)
-                                result_cap *= 2;
-                            result = (char *)realloc(result, result_cap);
-                        }
-                        memcpy(result + result_len, emit_start, (size_t)emit_len);
-                        result_len += (size_t)emit_len;
-                        result[result_len] = '\0';
-                    }
-                }
-            }
 
             tok_embed_bf16_to_f32(tmp_embed, ctx->decoder.tok_embeddings_bf16, token, dim);
             token = qwen_decoder_forward(ctx, tmp_embed);
@@ -1850,86 +1775,47 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
             if (candidate_len < 0) candidate_len = 0;
         }
 
-        /* Text-level monotonic commit:
-         * Decode candidate tokens to text and compare byte-by-byte with
-         * the committed result.  Only emit/append text that extends past
-         * what's already in result.  This handles tokenization differences
-         * that arise after EOS-reset regenerations in live streaming. */
+        /* Streaming commit: emit token delta against the previous candidate.
+         * We do not attempt monotonic byte-level reconciliation here. */
         int *candidate_tokens = raw_tokens + text_start;
         {
-            /* Build candidate text string, counting tokens past the
-             * pre-eager committed frontier for perf stats. */
-            size_t cand_cap = 256;
-            size_t cand_len = 0;
-            char *cand_text = (char *)malloc(cand_cap);
-            int new_token_count = 0;
-
-            if (cand_text) {
-                cand_text[0] = '\0';
-                for (int i = 0; i < candidate_len; i++) {
-                    const char *piece =
-                        qwen_tokenizer_decode(tokenizer, candidate_tokens[i]);
-                    size_t plen = strlen(piece);
-                    if (cand_len >= result_len_before_eager)
-                        new_token_count++;
-                    if (cand_len + plen + 1 > cand_cap) {
-                        while (cand_len + plen + 1 > cand_cap) cand_cap *= 2;
-                        cand_text = (char *)realloc(cand_text, cand_cap);
-                    }
-                    memcpy(cand_text + cand_len, piece, plen);
-                    cand_len += plen;
-                    cand_text[cand_len] = '\0';
+            if (candidate_len > stable_text_cap) {
+                while (candidate_len > stable_text_cap) stable_text_cap *= 2;
+                int *tmp_stable = (int *)realloc(stable_text_tokens,
+                                                 (size_t)stable_text_cap * sizeof(int));
+                if (!tmp_stable) {
+                    candidate_len = n_stable_text_tokens;
+                } else {
+                    stable_text_tokens = tmp_stable;
                 }
-
-                /* Byte-level common prefix with committed result */
-                size_t common = 0;
-                size_t climit = result_len < cand_len ? result_len : cand_len;
-                while (common < climit && result[common] == cand_text[common])
-                    common++;
-
-                if (common < result_len_before_eager && qwen_verbose >= 2)
-                    fprintf(stderr,
-                            "  Commit: text divergence at byte %zu "
-                            "(committed=%zu), keeping committed prefix\n",
-                            common, result_len_before_eager);
-
-                /* Append text that extends past current result_len.
-                 * Eagerly emitted bytes are already in result, so
-                 * this only picks up text the commit adds beyond that. */
-                if (common >= result_len && cand_len > result_len) {
-                    const char *new_text = cand_text + result_len;
-                    size_t new_len = cand_len - result_len;
-
-                    if (ctx->token_cb)
-                        ctx->token_cb(new_text, ctx->token_cb_userdata);
-
-                    if (result_len + new_len + 1 > result_cap) {
-                        while (result_len + new_len + 1 > result_cap)
-                            result_cap *= 2;
-                        result = (char *)realloc(result, result_cap);
-                    }
-                    memcpy(result + result_len, new_text, new_len);
-                    result_len += new_len;
-                    result[result_len] = '\0';
-                }
-
-                ctx->perf_text_tokens += new_token_count;
-
-                /* Update stable_text_tokens for bookkeeping. */
-                if (candidate_len > stable_text_cap) {
-                    while (candidate_len > stable_text_cap) stable_text_cap *= 2;
-                    int *tmp_stable = (int *)realloc(stable_text_tokens,
-                                                     (size_t)stable_text_cap * sizeof(int));
-                    if (tmp_stable) stable_text_tokens = tmp_stable;
-                }
-                if (candidate_len <= stable_text_cap) {
-                    memcpy(stable_text_tokens, candidate_tokens,
-                           (size_t)candidate_len * sizeof(int));
-                    n_stable_text_tokens = candidate_len;
-                }
-
-                free(cand_text);
             }
+
+            int lcp = 0;
+            while (lcp < n_stable_text_tokens &&
+                   lcp < candidate_len &&
+                   stable_text_tokens[lcp] == candidate_tokens[lcp]) {
+                lcp++;
+            }
+
+            for (int i = lcp; i < candidate_len; i++) {
+                int tok = candidate_tokens[i];
+                stable_text_tokens[i] = tok;
+
+                const char *piece = qwen_tokenizer_decode(tokenizer, tok);
+                if (ctx->token_cb) ctx->token_cb(piece, ctx->token_cb_userdata);
+
+                size_t plen = strlen(piece);
+                if (result_len + plen + 1 > result_cap) {
+                    while (result_len + plen + 1 > result_cap) result_cap *= 2;
+                    result = (char *)realloc(result, result_cap);
+                }
+                memcpy(result + result_len, piece, plen);
+                result_len += plen;
+                result[result_len] = '\0';
+                ctx->perf_text_tokens++;
+            }
+
+            n_stable_text_tokens = candidate_len;
         }
 
         if (qwen_verbose >= 2) {
