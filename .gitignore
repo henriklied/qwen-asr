@@ -1,11 +1,31 @@
+# Build artifacts
 *.o
-qwen_asr
+libqwen_asr.so
+libqwen_asr.dylib
+
+# Don't ignore qwen_asr/ Python package
+!qwen_asr/
+
+# Python
 venv/
 venv312/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# Models (large files)
 qwen3-asr-0.6b/
 qwen3-asr-1.7b/
-__pycache__/
+Qwen3-ASR/
+
+# System
 .DS_Store
-samples/extra
-Qwen3-ASR
+
+# Project
+samples/extra/
 TODO.md

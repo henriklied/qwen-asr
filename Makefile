@@ -17,7 +17,7 @@ TARGET = qwen_asr
 # Debug build flags
 DEBUG_CFLAGS = -Wall -Wextra -g -O0 -DDEBUG -fsanitize=address
 
-.PHONY: all clean debug info help blas test test-stream-cache
+.PHONY: all clean debug info help blas test test-stream-cache shared pytest
 
 # Default: show available targets
 all: help
@@ -27,15 +27,18 @@ help:
 	@echo ""
 	@echo "Choose a backend:"
 	@echo "  make blas     - With BLAS acceleration (Accelerate/OpenBLAS)"
+	@echo "  make shared   - Build shared library for Python bindings"
 	@echo ""
 	@echo "Other targets:"
 	@echo "  make debug    - Debug build with AddressSanitizer"
-	@echo "  make test     - Run regression suite (requires ./qwen_asr and model files)"
+	@echo "  make test     - Run C regression suite (requires ./qwen_asr and model files)"
+	@echo "  make pytest   - Run Python test suite"
 	@echo "  make test-stream-cache - Run stream cache on/off equivalence check"
 	@echo "  make clean    - Remove build artifacts"
 	@echo "  make info     - Show build configuration"
 	@echo ""
 	@echo "Example: make blas && ./qwen_asr -d model_dir -i audio.wav"
+	@echo "Example: make shared && make pytest"
 
 # =============================================================================
 # Backend: blas (Accelerate on macOS, OpenBLAS on Linux)
@@ -73,7 +76,9 @@ debug:
 # Utilities
 # =============================================================================
 clean:
-	rm -f $(OBJS) main.o $(TARGET)
+	rm -f $(OBJS) main.o
+	@if [ -f $(TARGET) ]; then rm -f $(TARGET); fi
+	rm -f libqwen_asr.so libqwen_asr.dylib
 
 info:
 	@echo "Platform: $(UNAME_S)"
@@ -87,6 +92,31 @@ endif
 
 test:
 	./asr_regression.py --binary ./qwen_asr --model-dir qwen3-asr-1.7b
+
+# =============================================================================
+# Python bindings: shared library
+# =============================================================================
+SHARED_TARGET = libqwen_asr.$(if $(filter Darwin,$(UNAME_S)),dylib,so)
+SHARED_CFLAGS = $(CFLAGS_BASE) -fPIC -DUSE_BLAS
+ifeq ($(UNAME_S),Darwin)
+SHARED_CFLAGS += -DACCELERATE_NEW_LAPACK
+SHARED_LDFLAGS = -shared -framework Accelerate -lm -lpthread
+else
+SHARED_CFLAGS += -DUSE_OPENBLAS -I/usr/include/openblas
+SHARED_LDFLAGS = -shared -lopenblas -lm -lpthread
+endif
+
+shared:
+	@$(MAKE) clean
+	@for src in $(SRCS); do \
+		$(CC) $(SHARED_CFLAGS) -c -o $${src%.c}.o $$src; \
+	done
+	$(CC) $(SHARED_CFLAGS) $(SHARED_LDFLAGS) -o $(SHARED_TARGET) $(OBJS)
+	@echo ""
+	@echo "Built shared library: $(SHARED_TARGET)"
+
+pytest:
+	uv run pytest tests/ -v
 
 # =============================================================================
 # Dependencies
